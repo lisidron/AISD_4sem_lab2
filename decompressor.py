@@ -37,7 +37,6 @@ except ImportError:
 
 
 def load_compressed_data(filepath):
-    """Загружает метаданные и сжатые байтовые потоки из файла."""
     metadata = None
     y_data, cb_data, cr_data = None, None, None
     try:
