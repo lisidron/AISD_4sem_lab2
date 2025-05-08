@@ -15,29 +15,26 @@ import rle_ac
 import vli
 import huffman
 
+# Загрузка настроек по умолчанию
 try:
     import constants
 except ImportError:
-    class DefaultConstants:
-        Bites_for_param = 4
-        ByteOrder = 'big'
-        Channels = 3
-    constants = DefaultConstants()
-    print("Предупреждение: Файл constants.py не найден, используются значения по умолчанию.", file=sys.stderr)
+    class FallbackConstants:
+        PARAM_BYTES = 4
+        BYTE_ORDER = 'big'
+        COLOR_CHANNELS = 3
+    constants = FallbackConstants()
+    print("Не найден constants.py — применяются значения по умолчанию", file=sys.stderr)
 
-
-BASE_Q_LUMINANCE = np.array([
-    [16, 11, 10, 16, 24, 40, 51, 61],
+LUMA_QTABLE = np.array([[16, 11, 10, 16, 24, 40, 51, 61],
     [12, 12, 14, 19, 26, 58, 60, 55],
     [14, 13, 16, 24, 40, 57, 69, 56],
     [14, 17, 22, 29, 51, 87, 80, 62],
     [18, 22, 37, 56, 68, 109, 103, 77],
     [24, 35, 55, 64, 81, 104, 113, 92],
     [49, 64, 78, 87, 103, 121, 120, 101],
-    [72, 92, 95, 98, 112, 100, 103, 99]
-], dtype=np.uint8)
-
-BASE_Q_CHROMINANCE = np.array([
+    [72, 92, 95, 98, 112, 100, 103, 99]], dtype=np.uint8)
+CHROMA_QTABLE = np.array([
     [17, 18, 24, 47, 99, 99, 99, 99],
     [18, 21, 26, 66, 99, 99, 99, 99],
     [24, 26, 56, 99, 99, 99, 99, 99],
@@ -48,170 +45,153 @@ BASE_Q_CHROMINANCE = np.array([
     [99, 99, 99, 99, 99, 99, 99, 99]
 ], dtype=np.uint8)
 
-def save_compressed_data(filepath, metadata, y_data, cb_data, cr_data):
-    """Сохраняет метаданные и сжатые байтовые потоки в файл."""
+
+def write_encoded_file(filename, meta, y_bytes, cb_bytes, cr_bytes):
     try:
-        metadata_bytes = json.dumps(metadata, indent=4).encode('utf-8')
-        header_len = len(metadata_bytes)
+        header_json = json.dumps(meta, indent=4).encode('utf-8')
+        header_size = len(header_json)
 
-        with open(filepath, 'wb') as f:
-            f.write(b'MYJPEG')
-            f.write(header_len.to_bytes(constants.Bites_for_param, constants.ByteOrder))
-            f.write(metadata_bytes)
-            f.write(y_data)
-            f.write(cb_data)
-            f.write(cr_data)
-        print(f"Сжатые данные сохранены в {filepath}")
-        print(f"Размер метаданных: {header_len} байт")
-        print(f"Размер данных Y: {len(y_data)} байт")
-        print(f"Размер данных Cb: {len(cb_data)} байт")
-        print(f"Размер данных Cr: {len(cr_data)} байт")
-        total_size = len(b'MYJPEG') + constants.Bites_for_param + header_len + len(y_data) + len(cb_data) + len(cr_data)
-        print(f"Общий размер файла: {total_size} байт")
-        orig_pixels = metadata['original_width'] * metadata['original_height'] * 3
-        if orig_pixels > 0:
-             ratio = orig_pixels / total_size
-             print(f"Степень сжатия (приближенно): {ratio:.2f}x")
+        with open(filename, 'wb') as file:
+            file.write(b'MYJPEG')
+            file.write(header_size.to_bytes(constants.PARAM_BYTES, constants.BYTE_ORDER))
+            file.write(header_json)
+            file.write(y_bytes)
+            file.write(cb_bytes)
+            file.write(cr_bytes)
 
-    except IOError as e:
-        print(f"Ошибка записи файла {filepath}: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Неожиданная ошибка при сохранении файла: {e}", file=sys.stderr)
+        print(f"\n Файл сохранён: {filename}")
+        print(f" Размер заголовка: {header_size} байт")
+        print(f" Y: {len(y_bytes)} байт, Cb: {len(cb_bytes)} байт, Cr: {len(cr_bytes)} байт")
 
-def compress_image(image_path, output_path, quality=75, block_size=8):
-    """
-    Выполняет сжатие изображения из стандартного формата (PNG, BMP, и т.д.)
-    по алгоритму, похожему на JPEG Baseline.
-    """
-    print(f"Начало сжатия '{image_path}' с качеством {quality}...")
+        original_pixels = meta['original_width'] * meta['original_height'] * 3
+        final_size = sum(map(len, [b'MYJPEG', y_bytes, cb_bytes, cr_bytes])) + constants.PARAM_BYTES + header_size
+        compression_ratio = original_pixels / final_size if final_size > 0 else 0
+        print(f" Сжатие: ~{compression_ratio:.2f}x")
+
+    except IOError as io_err:
+        print(f" Ошибка записи: {io_err}", file=sys.stderr)
+    except Exception as ex:
+        print(f" Неожиданная ошибка: {ex}", file=sys.stderr)
+
+
+def jpeg_like_compression(input_image, output_file, quality=75, tile_size=8):
+    print(f"\n Старт обработки: {input_image} (качество: {quality})")
 
     try:
-        img = Image.open(image_path)
-        if img.mode != 'RGB':
-             print(f"Конвертация изображения из режима '{img.mode}' в 'RGB'...")
-             img = img.convert('RGB')
-
-        img_rgb = np.array(img)
-        original_height, original_width, num_channels = img_rgb.shape
-
-        if num_channels != 3:
-            raise ValueError(f"Ожидалось 3 канала RGB, получено {num_channels}")
-
-        print(f"Исходный размер: {original_width}x{original_height}")
+        with Image.open(input_image) as im:
+            if im.mode != 'RGB':
+                print(f" Перевод из {im.mode} в RGB")
+                im = im.convert('RGB')
+            rgb_array = np.array(im)
 
     except FileNotFoundError:
-        print(f"Ошибка: Файл не найден {image_path}", file=sys.stderr)
+        print(f" Файл не найден: {input_image}", file=sys.stderr)
         return
-    except Exception as e:
-        print(f"Ошибка при чтении или подготовке изображения: {e}", file=sys.stderr)
+    except Exception as err:
+        print(f" Ошибка при загрузке: {err}", file=sys.stderr)
         return
 
-    print("Преобразование в YCbCr...")
-    img_ycbcr = ycbcr.rgb_to_ycbcr(img_rgb)
-    y_channel  = img_ycbcr[:, :, 0]
-    cb_channel = img_ycbcr[:, :, 1]
-    cr_channel = img_ycbcr[:, :, 2]
+    height, width, channels = rgb_array.shape
+    if channels != 3:
+        print(f" Ожидалось 3 канала RGB, получено: {channels}", file=sys.stderr)
+        return
 
-    print("Даунсэмплинг Cb и Cr...")
-    cb_downsampled = downsampling.downsample_channel_420(cb_channel)
-    cr_downsampled = downsampling.downsample_channel_420(cr_channel)
-    print(f"  Размер Y : {y_channel.shape}")
-    print(f"  Размер Cb (DS): {cb_downsampled.shape}")
-    print(f"  Размер Cr (DS): {cr_downsampled.shape}")
+    print(f" Размер: {width}x{height}")
 
-    print("Подготовка таблиц квантования и Хаффмана...")
-    q_matrix_y = quantization.adjust_quantization_matrix(BASE_Q_LUMINANCE, quality)
-    q_matrix_c = quantization.adjust_quantization_matrix(BASE_Q_CHROMINANCE, quality)
+    # Преобразование цвета
+    ycbcr_img = ycbcr.rgb_to_ycbcr(rgb_array)
+    y_plane, cb_plane, cr_plane = ycbcr_img[:, :, 0], ycbcr_img[:, :, 1], ycbcr_img[:, :, 2]
+
+    print(" Даунсэмплирование...")
+    cb_ds = downsampling.downsample_channel_420(cb_plane)
+    cr_ds = downsampling.downsample_channel_420(cr_plane)
+
+    print(" Подготовка матриц и таблиц...")
+    q_y = quantization.adjust_quantization_matrix(LUMA_QTABLE, quality)
+    q_c = quantization.adjust_quantization_matrix(CHROMA_QTABLE, quality)
 
     try:
-        huff_dc_y = huffman.HuffmanTable(huffman.DEFAULT_DC_LUMINANCE_BITS, huffman.DEFAULT_DC_LUMINANCE_HUFFVAL)
-        huff_ac_y = huffman.HuffmanTable(huffman.DEFAULT_AC_LUMINANCE_BITS, huffman.DEFAULT_AC_LUMINANCE_HUFFVAL)
-        huff_dc_c = huffman.HuffmanTable(huffman.DEFAULT_DC_CHROMINANCE_BITS, huffman.DEFAULT_DC_CHROMINANCE_HUFFVAL)
-        huff_ac_c = huffman.HuffmanTable(huffman.DEFAULT_AC_CHROMINANCE_BITS, huffman.DEFAULT_AC_CHROMINANCE_HUFFVAL)
-    except ValueError as e:
-         print(f"Ошибка при создании таблиц Хаффмана из стандартных спецификаций: {e}", file=sys.stderr)
-         return
-
-    components_data = {}
-    padded_dims = {}
-    num_blocks_total = 0
-
-    try:
-        for name, channel, q_matrix, dc_table, ac_table in [
-            ('Y', y_channel, q_matrix_y, huff_dc_y, huff_ac_y),
-            ('Cb', cb_downsampled, q_matrix_c, huff_dc_c, huff_ac_c),
-            ('Cr', cr_downsampled, q_matrix_c, huff_dc_c, huff_ac_c)
-        ]:
-            print(f"Обработка компонента {name}...")
-            h_orig, w_orig = channel.shape
-            h_pad = math.ceil(h_orig / block_size) * block_size
-            w_pad = math.ceil(w_orig / block_size) * block_size
-            padded_dims[name] = (h_pad, w_pad)
-
-            blocks = tiling.split_into_blocks(channel, block_size, fill_value=128)
-            num_blocks_comp = len(blocks)
-            num_blocks_total += num_blocks_comp
-            print(f"  {name}: {num_blocks_comp} блоков ({block_size}x{block_size})")
-
-            quantized_blocks_data = []
-            all_dc_coeffs = []
-
-            for i, block in enumerate(blocks):
-                block_shifted = block.astype(np.float64) - 128.0
-                dct_coeffs = dct.dct2(block_shifted)
-                quantized_coeffs = quantization.quantize(dct_coeffs, q_matrix)
-                all_dc_coeffs.append(quantized_coeffs[0, 0])
-                ac_coeffs_flat = zigzag.zigzag_scan(quantized_coeffs)[1:]
-                ac_rle = rle_ac.prepare_ac_coefficients_for_rle(ac_coeffs_flat.tolist())
-                quantized_blocks_data.append([None, None, ac_rle])
-
-            dc_diffs = differential_dc.dpcm_encode_dc(all_dc_coeffs)
-            for i, dc_diff in enumerate(dc_diffs):
-                dc_category, dc_vli_bits = vli.get_vli_category_and_value(dc_diff)
-                quantized_blocks_data[i][0] = dc_category
-                quantized_blocks_data[i][1] = dc_vli_bits
-
-            print(f"  Кодирование Хаффмана для {name}...")
-            compressed_data = huffman.huff_encode_blocks(quantized_blocks_data, dc_table, ac_table)
-            components_data[name] = compressed_data
-            print(f"    Размер сжатых данных {name}: {len(compressed_data)} байт")
-
-    except Exception as e:
-        print(f"Ошибка на этапе обработки блока или кодирования Хаффмана: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
+        huff_tables = {
+            "Y_DC": huffman.HuffmanTable(huffman.DEFAULT_DC_LUMINANCE_BITS, huffman.DEFAULT_DC_LUMINANCE_HUFFVAL),
+            "Y_AC": huffman.HuffmanTable(huffman.DEFAULT_AC_LUMINANCE_BITS, huffman.DEFAULT_AC_LUMINANCE_HUFFVAL),
+            "C_DC": huffman.HuffmanTable(huffman.DEFAULT_DC_CHROMINANCE_BITS, huffman.DEFAULT_DC_CHROMINANCE_HUFFVAL),
+            "C_AC": huffman.HuffmanTable(huffman.DEFAULT_AC_CHROMINANCE_BITS, huffman.DEFAULT_AC_CHROMINANCE_HUFFVAL),
+        }
+    except ValueError as err:
+        print(f" Ошибка инициализации Хаффмана: {err}", file=sys.stderr)
         return
 
-    metadata = {
-        "original_width": original_width,
-        "original_height": original_height,
-        "block_size": block_size,
+    # Обработка всех компонент
+    all_encoded = {}
+    padded_sizes = {}
+
+    for label, channel, q_matrix, dc_huff, ac_huff in [
+        ('Y', y_plane, q_y, huff_tables["Y_DC"], huff_tables["Y_AC"]),
+        ('Cb', cb_ds, q_c, huff_tables["C_DC"], huff_tables["C_AC"]),
+        ('Cr', cr_ds, q_c, huff_tables["C_DC"], huff_tables["C_AC"]),
+    ]:
+        print(f"\n Компонент: {label}")
+        h, w = channel.shape
+        h_padded = math.ceil(h / tile_size) * tile_size
+        w_padded = math.ceil(w / tile_size) * tile_size
+        padded_sizes[label] = (h_padded, w_padded)
+
+        blocks = tiling.split_into_blocks(channel, tile_size, fill_value=128)
+        dct_blocks = []
+        dc_values = []
+
+        for blk in blocks:
+            shifted = blk.astype(np.float64) - 128.0
+            transformed = dct.dct2(shifted)
+            quantized = quantization.quantize(transformed, q_matrix)
+            dc_values.append(quantized[0, 0])
+
+            zz = zigzag.zigzag_scan(quantized)[1:]
+            ac_encoded = rle_ac.prepare_ac_coefficients_for_rle(zz.tolist())
+            dct_blocks.append([None, None, ac_encoded])
+
+        dc_deltas = differential_dc.dpcm_encode_dc(dc_values)
+        for i, delta in enumerate(dc_deltas):
+            category, bits = vli.get_vli_category_and_value(delta)
+            dct_blocks[i][0] = category
+            dct_blocks[i][1] = bits
+
+        print(f" Хаффман {label}")
+        encoded_stream = huffman.huff_encode_blocks(dct_blocks, dc_huff, ac_huff)
+        all_encoded[label] = encoded_stream
+        print(f" {label} готово: {len(encoded_stream)} байт")
+
+    # Метаданные
+    image_info = {
+        "original_width": width,
+        "original_height": height,
+        "block_size": tile_size,
         "quality": quality,
-        "padded_dims_y": padded_dims['Y'],
-        "padded_dims_cb": padded_dims['Cb'],
-        "padded_dims_cr": padded_dims['Cr'],
-        "q_table_y": q_matrix_y.tolist(),
-        "q_table_c": q_matrix_c.tolist(),
-        "huff_dc_y_bits": huff_dc_y.bit_counts,
-        "huff_dc_y_huffval": huff_dc_y.symbols,
-        "huff_ac_y_bits": huff_ac_y.bit_counts,
-        "huff_ac_y_huffval": huff_ac_y.symbols,
-        "huff_dc_c_bits": huff_dc_c.bit_counts,
-        "huff_dc_c_huffval": huff_dc_c.symbols,
-        "huff_ac_c_bits": huff_ac_c.bit_counts,
-        "huff_ac_c_huffval": huff_ac_c.symbols,
-        "data_len_y": len(components_data['Y']),
-        "data_len_cb": len(components_data['Cb']),
-        "data_len_cr": len(components_data['Cr']),
+        "padded_dims_y": padded_sizes['Y'],
+        "padded_dims_cb": padded_sizes['Cb'],
+        "padded_dims_cr": padded_sizes['Cr'],
+        "q_table_y": q_y.tolist(),
+        "q_table_c": q_c.tolist(),
+        "huff_dc_y_bits": huff_tables["Y_DC"].bit_counts,
+        "huff_dc_y_huffval": huff_tables["Y_DC"].symbols,
+        "huff_ac_y_bits": huff_tables["Y_AC"].bit_counts,
+        "huff_ac_y_huffval": huff_tables["Y_AC"].symbols,
+        "huff_dc_c_bits": huff_tables["C_DC"].bit_counts,
+        "huff_dc_c_huffval": huff_tables["C_DC"].symbols,
+        "huff_ac_c_bits": huff_tables["C_AC"].bit_counts,
+        "huff_ac_c_huffval": huff_tables["C_AC"].symbols,
+        "data_len_y": len(all_encoded['Y']),
+        "data_len_cb": len(all_encoded['Cb']),
+        "data_len_cr": len(all_encoded['Cr']),
     }
 
-    print("Сохранение результата...")
-    save_compressed_data(
-        output_path,
-        metadata,
-        components_data['Y'],
-        components_data['Cb'],
-        components_data['Cr']
+    print("\n Сохранение...")
+    write_encoded_file(
+        output_file,
+        image_info,
+        all_encoded['Y'],
+        all_encoded['Cb'],
+        all_encoded['Cr']
     )
 
-    print(f"Сжатие '{image_path}' завершено. Результат в '{output_path}'.")
+    print(f"\n Завершено: {input_image} - {output_file}")
